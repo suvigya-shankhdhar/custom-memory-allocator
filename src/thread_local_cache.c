@@ -43,7 +43,7 @@ void tlc_push(void* p, int idx) {
     Block *new_block = (Block*)p; 
     new_block->next = tlc->head[idx]; 
     tlc->head[idx] = new_block; 
-    tlc->head[idx]++; 
+    tlc->count[idx]++; 
     if (tlc->head[idx] > MAX_BLOCK_COUNT) {
         tlc_flush(idx); 
     }    
@@ -51,4 +51,17 @@ void tlc_push(void* p, int idx) {
 
 void tlc_flush(int idx) {
     pthread_mutex_lock(&(central_cache.locks[idx])); 
+    int blocks_to_move = tlc->count[idx]; 
+
+    for(int i = 0; i < blocks_to_move; i++) {
+        Block *move_block = tlc->head[idx]; 
+        tlc->head[idx] = move_block->next; 
+
+        move_block->next = central_cache.head[idx]; 
+        central_cache.head[idx] = move_block; 
+
+        tlc->count[idx]--; 
+
+    }
+    pthread_mutex_unlock(&(central_cache.locks[idx])); 
 }
