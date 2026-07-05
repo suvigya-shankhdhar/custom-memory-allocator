@@ -8,3 +8,9 @@
 * Central Cache: Shared global pool with fine-grained pthread_mutex locking for thread-cache refilling.
 
 * Page-Level Management: Uses mmap() to request 4KB pages from the kernel, which are then carved into fixed-size blocks.
+
+## Build and Run
+
+To compile the allocator and run the included multi-threaded test:
+
+make run
