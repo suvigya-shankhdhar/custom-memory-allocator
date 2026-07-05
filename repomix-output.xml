@@ -1,0 +1,537 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+include/
+  my_alloc.h
+src/
+  api.c
+  central_cache.c
+  central_cache.h
+  internals.c
+  internals.h
+  thread_local_cache.c
+  thread_local_cache.h
+.gitignore
+allocator_test
+main.c
+Makefile
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="include/my_alloc.h">
+#ifndef MY_ALLOC_H
+#define MY_ALLOC_H
+#include <unistd.h>
+#include <stdint.h>
+
+void *my_alloc(size_t size); 
+void my_free(void *ptr); 
+void *my_realloc(void *ptr, size_t size); 
+void *my_calloc(size_t nmemb, size_t size); 
+int   my_posix_memalign(void **memptr, size_t alignment, size_t size);
+void  my_malloc_stats(void);
+
+#endif
+</file>
+
+<file path="src/api.c">
+#include "../include/my_alloc.h"
+#include "internals.h"
+#include "thread_local_cache.h"
+#include "central_cache.h"
+
+static pthread_once_t init_once = PTHREAD_ONCE_INIT; 
+extern __thread ThreadCache *tlc;
+
+// If requested size > PAGE_SIZE, call large_allocation(),
+// otherwise return Block just greater than requested size
+// from thread local cache.
+// Returns NULL, if failed
+void *my_alloc(size_t size) { 
+    if (size == 0) { return NULL; }
+    pthread_once(&init_once, init_central_cache); 
+    if (tlc == NULL) {
+        init_thread_local_cache(); 
+    }
+    if (size > PAGE_SIZE) {
+        return large_allocation(size); 
+    }
+    
+    uint8_t idx = _index(size); 
+    void *ptr = tlc_pop(idx); 
+    if (ptr == NULL) {
+        grow_thread_local_cache(idx); 
+        ptr = tlc_pop(idx); 
+    }
+    return ptr;
+}
+
+
+void my_free(void *ptr) {
+    if (ptr == NULL) {return; }
+    if((uintptr_t*)ptr >= (uintptr_t*)heap_start && (uintptr_t*)ptr < (uintptr_t*)heap_end){
+        uint8_t idx = index_from_ptr(ptr); 
+        tlc_push(ptr, idx); 
+
+    }
+    else {
+        free_large_allocation(ptr); 
+    }
+}
+</file>
+
+<file path="src/central_cache.c">
+#include "central_cache.h"
+#include "internals.h"
+#include <stdio.h>
+
+// #include "include/thread_local_cache.h"
+// #include "include/allocator.h"
+
+CentralCache central_cache; 
+uint8_t page_metadata[MAX_PAGES];
+
+void *heap_start = NULL;    // Points to the start of master arena 
+void *current_page = NULL;  // Points to the first page that is free
+void *heap_end = NULL;      // Points to end of master arena
+
+// Initializes the central cache struct 
+void init_central_cache(void) {
+    for (int i=0; i < NUM_CLASSES; i++ ){
+        central_cache.head[i] = NULL; 
+        central_cache.count[i] = 0; 
+        pthread_mutex_init(&central_cache.locks[i], NULL); 
+    }
+
+    heap_start = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); 
+    if (heap_start == MAP_FAILED) {
+        perror("Failed to allocate master arena"); 
+        exit(1);
+    }
+    current_page = heap_start; 
+    heap_end = (char*)heap_start + ARENA_SIZE; 
+}
+
+// Extract a portion of central free list, add it to front of thread local list
+size_t fetch_from_central_cache(uint8_t idx, Block **start, Block **end, size_t batch_size) {
+    pthread_mutex_lock(&central_cache.locks[idx]); 
+
+    // If central cache is empty for this size, expand it from master Arena
+    if(central_cache.head[idx] == NULL) {
+        grow_central_cache(idx); 
+        if (central_cache.head[idx] == NULL) { // If master Arena is full 
+            pthread_mutex_unlock(&central_cache.locks[idx]); 
+            return 0; 
+        }
+    }
+
+    Block *curr = central_cache.head[idx]; 
+    *start = curr; 
+
+    size_t allocated = 0; 
+    Block *prev = NULL; 
+    while(curr != NULL && allocated < batch_size) {
+        prev = curr;
+        curr = curr->next; 
+        allocated++; 
+    }
+
+    // Detach the batch from central cache list
+    central_cache.head[idx] = curr; 
+    central_cache.count[idx] -= allocated; 
+
+    // Seal the end of the batch chain handed back to the thread
+    if(prev != NULL) {
+        prev->next = NULL; 
+        *end = prev;
+    }
+
+    pthread_mutex_unlock(&central_cache.locks[idx]); 
+    return allocated; 
+}
+
+//
+void release_to_central_cache(uint8_t idx, Block *start, size_t batch_size) {
+    pthread_mutex_lock(&central_cache.locks[idx]); 
+
+    Block *curr = start; 
+    while(curr->next != NULL) {
+        curr = curr->next; 
+    }
+
+    curr->next = central_cache.head[idx];
+    central_cache.head[idx] = start; 
+    central_cache.count[idx] += batch_size; 
+
+    pthread_mutex_unlock(&central_cache.locks[idx]); 
+}
+
+// Takes a new page from master arena, 
+// divides it into Blocks of requested Class and inerts them 
+// into corresponding central free list.
+void grow_central_cache(uint8_t idx) {
+    
+    size_t class_size = get_class_size(idx); 
+    void *new_page = current_page; 
+    current_page = (char*)current_page + PAGE_SIZE; 
+    size_t page_offset = ((char*)new_page - (char*)heap_start) / (PAGE_SIZE); 
+    page_metadata[page_offset] = idx; 
+    for(int offset = 0; offset + class_size <= PAGE_SIZE; offset += class_size) {
+        Block *new_block = (Block*)((char*)new_page + offset); 
+        new_block->next = central_cache.head[idx]; 
+        central_cache.head[idx] = new_block; 
+        central_cache.count[idx]++; 
+    }
+}
+</file>
+
+<file path="src/central_cache.h">
+#ifndef CENTRAL_CACHE_H
+#define CENTRAL_CACHE_H
+
+#include <unistd.h>
+#include <sys/mman.h>
+#include <pthread.h>
+#include "internals.h"
+#include <stdlib.h>
+
+// Used to keep Central free lists for 
+// all the size classes
+struct CentralCache {
+    Block *head[NUM_CLASSES]; 
+    uint32_t count[NUM_CLASSES]; 
+    pthread_mutex_t locks[NUM_CLASSES];
+}; 
+typedef struct CentralCache CentralCache; 
+
+
+void init_central_cache(void);      // Initialize the central cache struct
+size_t fetch_from_central_cache(uint8_t idx, Block **start, Block **end, size_t batch_size); // Extract a portion of central free list and add it to front of thread local list
+void release_to_central_cache(uint8_t idx, Block *start, size_t batch_size); // Returns a portion of thread local list back to central free list
+void grow_central_cache(uint8_t idx);   // If central free list is empty, grow it using master Arena
+
+#endif
+</file>
+
+<file path="src/internals.c">
+#include "internals.h"
+
+// Returns a block of size in multiple of PAGE_SIZE, 
+// this is just greater than requested size 
+void *large_allocation(size_t size) {
+    size_t aligned_size = (size + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
+    void* raw_ptr = mmap(NULL, aligned_size + LARGE_BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw_ptr == MAP_FAILED) { return NULL; } 
+    LargeBlock* new_large_block = (LargeBlock*) raw_ptr;
+    new_large_block->size = aligned_size + LARGE_BLOCK_SIZE; 
+    return (char*)new_large_block + LARGE_BLOCK_SIZE;  
+}
+
+
+void free_large_allocation(void *ptr) {
+    if (ptr == NULL) {return; }
+    LargeBlock* large_block = (LargeBlock*)((char*)ptr - LARGE_BLOCK_SIZE); 
+    size_t size = large_block->size; 
+    munmap(large_block, size);
+}
+
+// Returns index of size class having size just greater
+// than requested size
+uint8_t _index(size_t size) {
+
+    // Tier 1: 8B to 128B (8-byte intervals) (0, 1, 2,...., 15) (16 Classes)
+    if (size <= 128) {
+        return ((size + 7)/8) - 1; 
+    }
+
+    // Tier 2: 129B to 512B (32-byte intervals) (16, 17,...., 27) (12 Classes)
+    if (size <= 512) {
+        return 16 + ((size -128 + 31)/32) - 1; 
+    }
+
+    // Tier 3: 513B to 1024B (128-byte intervals) (28, 29,..., 31) (4 Classes)
+    if (size <= 1024) {
+        return 28 + ((size - 512 + 127)/128) - 1; 
+    }       
+
+    // Tier 4: 1025B to 4096B ( 512-byte inteval) (32, 33,..., 37) (6 Classes)
+    return 32 + (size - 1024 + 511)/512 - 1; 
+}
+
+uint8_t index_from_ptr(void *ptr) {
+    size_t page_offset = ((char*)ptr - (char*)heap_start)/PAGE_SIZE; 
+    return page_metadata[page_offset];
+}
+
+
+
+size_t get_class_size(uint8_t idx) {
+    if (idx < 16) {return (idx+1)*8; }
+    if (idx < 28) {return 128 + (idx-15) * 32; } 
+    if (idx < 32) {return 512 + (idx-27)*128; }
+    return 1024 + (idx - 31 )* 512; 
+}
+</file>
+
+<file path="src/internals.h">
+#ifndef INTERNALS_H
+#define INTERNALS_H
+
+#include <unistd.h>
+#include <stdint.h>
+#include <sys/mman.h>
+// #include "central_cache.h"
+// #include "thread_local_cache.h"
+
+#define ARENA_SIZE (1024ULL * 1024 * 1024 * 1)  // Maximum Arena Size is 1GB
+#define PAGE_SIZE 4096  // Page size is 4KB
+#define MAX_PAGES (ARENA_SIZE/PAGE_SIZE)    // Maxium Number of pages is 250,000
+#define NUM_CLASSES 38  // Number of different size classes
+
+
+// Used for allocations > PAGE_SIZE (4KB)
+struct LargeBlock {
+    size_t size; 
+}; 
+typedef struct LargeBlock LargeBlock; 
+
+// Used for both thread local lists and central lists.
+struct Block {
+    struct Block *next; 
+}; 
+typedef struct Block Block; 
+
+#define LARGE_BLOCK_SIZE sizeof(LargeBlock) 
+#define BLOCK_SIZE sizeof(Block)
+
+extern void *heap_start;    // Points to head of master Arena
+extern void *heap_end;      // Points to end of master Arena
+extern uint8_t page_metadata[MAX_PAGES];    // Keeps track of which size class each page belongs to
+
+void *large_allocation(size_t size);    // Handles allocations > PAGE_SIZE (4KB)
+void free_large_allocation(void *ptr);      // Frees allocations > PAGE_SIZE (4KB)
+
+uint8_t _index(size_t size);     // Returns index of size class having size just > requested size
+uint8_t index_from_ptr(void *ptr);      // Returns index of size class from give pointer
+size_t get_class_size(uint8_t idx);     // Returns size of size class from index
+
+#endif
+</file>
+
+<file path="src/thread_local_cache.c">
+#include "internals.h"
+#include "thread_local_cache.h"
+#include "central_cache.h"
+#include <stdint.h>
+
+// Defines a thread specific pointer to ThreadCache struct. 
+__thread ThreadCache *tlc = NULL; 
+
+// Allocates memory for tlc struct using mmap and 
+// initialises all Block *head[] to NULL and count[] to 0.
+void init_thread_local_cache() {
+    tlc = (ThreadCache*)mmap(NULL, sizeof(ThreadCache), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); 
+    for(int i = 0; i < NUM_CLASSES; i++){
+        tlc->head[i] = NULL; 
+        tlc->count[i] = 0; 
+    }
+}
+
+// Returns a pointer to the first Block of the requested list (class),
+// returns NULL if the list is empty. 
+void *tlc_pop(uint8_t idx) {
+    if (tlc->head[idx] == NULL) return NULL; 
+    Block *temp = tlc->head[idx]; 
+    tlc->head[idx] = temp->next; 
+    (tlc->count[idx])--; 
+    return (void*)temp; 
+}
+
+// Adds a free Block to the begining of free list, 
+// if the number of free Blocks exceed MAX_BLOCK_COUNT (defined in thread_local_cache.c), half
+// of the Blocks are returned to central free list.
+void tlc_push(void* p, uint8_t idx) {
+    Block *new_block = (Block*)p; 
+    new_block->next = tlc->head[idx]; 
+    tlc->head[idx] = new_block; 
+    (tlc->count[idx])++; 
+    if (tlc->count[idx] > MAX_BLOCK_COUNT) {
+        release_from_thread_local_cache(idx); 
+    }    
+}
+
+
+// Flush half of a thread local free list to the
+// central free list, when a particular free list exceeds
+// MAX_BLOCK_COUNT (defined in thread_local_cache.c). 
+void release_from_thread_local_cache(uint8_t idx) {
+    
+    Block *head = tlc->head[idx]; 
+    Block *temp = head;
+    for (int i = 0; i < MAX_BLOCK_COUNT/2; i++) {
+        temp = temp->next;
+    }
+    tlc->head[idx] = temp->next; 
+    temp->next = NULL; 
+    release_to_central_cache(idx, head, MAX_BLOCK_COUNT/2);
+}
+
+//
+void grow_thread_local_cache(uint8_t idx) {
+    
+    Block *batch_start = NULL; 
+    Block *batch_end = NULL; 
+    size_t target_batch = MAX_BLOCK_COUNT / 2; 
+    size_t allocated = fetch_from_central_cache(idx, &batch_start, &batch_end,target_batch); 
+    
+    if (allocated == 0) return;
+    batch_end->next = tlc->head[idx];
+    tlc->head[idx] = batch_start;
+    tlc->count[idx] += allocated; 
+}
+</file>
+
+<file path="src/thread_local_cache.h">
+#ifndef THREAD_LOCAL_CACHE_H
+#define THREAD_LOCAL_CACHE_H
+
+#include <unistd.h>
+#include <sys/mman.h>
+#include <pthread.h>
+#include "internals.h"
+
+#define MAX_BLOCK_COUNT 128     // Maximum number of blocks a particular class can have.
+
+// This structure is different for each thread.
+// Consists an array of linked lists, with Block *head[i] pointing to first Block of i'th free list. 
+// count[i] stores the number of free block available in i'th free list.  
+struct ThreadCache {
+    Block *head[NUM_CLASSES]; 
+    int    count[NUM_CLASSES];
+}; 
+typedef struct ThreadCache ThreadCache; 
+
+void init_thread_local_cache();     // Initialize ThreadCache struct
+// int get_class_idx(size_t);      // 
+void* tlc_pop(uint8_t idx);        // Pop and return the head of free list corresponding to idx
+void tlc_push(void*, uint8_t);     // 
+void grow_thread_local_cache(uint8_t idx);  
+void release_from_thread_local_cache(uint8_t idx); 
+#endif
+</file>
+
+<file path=".gitignore">
+*.o
+bin/
+.vscode/
+</file>
+
+<file path="main.c">
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+#include "include/my_alloc.h"
+
+void *thread_work(void *arg) {
+    int id = *(int*)arg;
+    printf("Thread %d starting...\n", id); 
+
+    for (int i = 0; i < 1000; i++) {
+
+        char *small_str = (char*) my_alloc(32); 
+        strcpy(small_str, "Hello Thread Cache!"); 
+        my_free(small_str); 
+
+        int *large_arr = (int *)my_alloc(8921); 
+        large_arr[0] = id; 
+        my_free(large_arr); 
+    }
+
+    printf("Thread %d finished successfully.\n", id); 
+    return NULL; 
+}
+
+int main() {
+    pthread_t threads[4]; 
+    int thread_ids[4] = {1, 2, 3, 4};
+        for (int i = 0; i < 4; i++) {
+            pthread_create(&threads[i], NULL, thread_work, &thread_ids[i]); 
+        }
+        for (int i = 0; i < 4; i++) {
+            pthread_join(threads[i], NULL); 
+        }
+    printf("All allocations and frees completed successfully\n");
+    return 0; 
+}
+</file>
+
+<file path="Makefile">
+CC = gcc
+# 1. Fixed the -g flag
+CFLAGS = -Wall -Wextra -pthread -g
+# 2. Fixed the include directory name
+INCLUDES = -I./include -I./src
+
+# 3. Fixed the thread_local_cache file extension
+SRCS = src/api.c src/central_cache.c src/internals.c src/thread_local_cache.c
+OBJS = $(SRCS:.c=.o)
+
+TARGET = allocator_test
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS) main.o
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) main.o
+
+%.o: %.c	
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+run: all
+	./$(TARGET)
+
+clean:
+	rm -f $(OBJS) main.o $(TARGET)
+</file>
+
+</files>
